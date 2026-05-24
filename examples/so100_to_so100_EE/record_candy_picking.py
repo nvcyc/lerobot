@@ -1,0 +1,421 @@
+#!/usr/bin/env python
+"""
+Record candy-picking demonstrations with SO-ARM100 leader-follower teleoperation.
+
+Hardware Setup:
+  - Follower: /dev/ttyACM0 (robot doing the task)
+  - Leader: /dev/ttyACM1 (human controls this one)
+  - Camera: Intel RealSense D455 (serial: 244422300478)
+
+Usage:
+  cd /workspace/lerobot/examples/so100_to_so100_EE
+  python record_candy_picking.py
+
+Controls during recording:
+  - Press 's' to STOP recording current episode and save
+  - Press 'r' to RE-RECORD current episode (discard and redo)
+  - Press 'q' to QUIT recording session
+"""
+
+import argparse
+from pathlib import Path
+
+from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+from lerobot.datasets.utils import combine_feature_dicts
+from lerobot.model.kinematics import RobotKinematics
+from lerobot.processor import RobotAction, RobotObservation, RobotProcessorPipeline
+from lerobot.processor.converters import (
+    observation_to_transition,
+    robot_action_observation_to_transition,
+    robot_action_to_transition,
+    transition_to_observation,
+    transition_to_robot_action,
+)
+from lerobot.processor.pipeline import IdentityProcessorStep
+from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
+from lerobot.robots.so_follower.so_follower import SOFollower
+from lerobot.robots.so_follower.robot_kinematic_processor import (
+    EEBoundsAndSafety,
+    ForwardKinematicsJointsToEE,
+    InverseKinematicsEEToJoints,
+)
+from lerobot.scripts.lerobot_record import record_loop
+from lerobot.teleoperators.so_leader.config_so_leader import SOLeaderTeleopConfig
+from lerobot.teleoperators.so_leader.so_leader import SOLeader
+from lerobot.utils.control_utils import init_keyboard_listener
+# Text-to-speech not available in headless Docker - using print() instead
+# from lerobot.utils.utils import log_say
+from lerobot.utils.visualization_utils import init_rerun
+
+# ============================================================================
+# CONFIGURATION - Customize these values
+# ============================================================================
+
+# Dataset configuration
+NUM_EPISODES = 50  # Number of demonstrations to collect
+FPS = 30  # Control frequency (Hz)
+EPISODE_TIME_SEC = 30  # Max time per episode (seconds)
+RESET_TIME_SEC = 10  # Time to reset environment between episodes
+TASK_DESCRIPTION = "Pick colored candy and place in front of person"
+HF_REPO_ID = "local/candy-picking-v1"  # Local storage (no upload)
+
+# Hardware ports
+FOLLOWER_PORT = "/dev/ttyACM0"  # Robot arm doing the task
+LEADER_PORT = "/dev/ttyACM1"    # Arm you control by hand
+
+# Camera configuration - Two D455 side views (RGB only)
+CAMERA_LEFT_SERIAL = "244422300478"   # D455 Camera 1
+CAMERA_RIGHT_SERIAL = "035322250292"  # D455 Camera 2
+CAMERA_FPS = 30
+CAMERA_WIDTH = 640   # 640x480 for speed, or 1280x720 for quality
+CAMERA_HEIGHT = 480
+USE_DEPTH = False    # RGB-only (no depth)
+
+# Note: Both D455 cameras on USB 3.2 - full bandwidth available!
+# If left/right cameras are swapped in your physical setup,
+# just swap the serial numbers above!
+
+# URDF path
+URDF_PATH = "/workspace/SO-ARM100/Simulation/SO101/so101_new_calib.urdf"
+
+# Safety bounds (meters, relative to robot base)
+EE_BOUNDS = {
+    "min": [-0.4, -0.4, 0.0],  # [x, y, z] minimum
+    "max": [0.4, 0.4, 0.5]     # [x, y, z] maximum
+}
+MAX_EE_STEP_M = 0.05  # Max end-effector movement per step (5cm)
+
+# ============================================================================
+# MAIN RECORDING SCRIPT
+# ============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Record candy-picking demonstrations with SO-ARM100 leader-follower teleoperation."
+    )
+    parser.add_argument(
+        "--dataset-location",
+        type=Path,
+        default=None,
+        help=(
+            "Parent directory where datasets should be stored. "
+            "When set, this dataset is stored under <dataset-location>/<repo-id>. "
+            "When omitted, LeRobot's default cache location is used."
+        ),
+    )
+    return parser.parse_args()
+
+
+def teleop_action_tuple_to_transition(action_observation: tuple[RobotAction, RobotObservation]):
+    action, _observation = action_observation
+    return robot_action_to_transition(action)
+
+
+def main():
+    args = parse_args()
+    dataset_root = args.dataset_location / HF_REPO_ID if args.dataset_location is not None else None
+
+    print("\n" + "=" * 60)
+    print("SO-ARM100 Candy-Picking Data Collection")
+    print("=" * 60)
+    print()
+    print(f"Target dataset: {HF_REPO_ID}")
+    print(f"Dataset location: {dataset_root if dataset_root is not None else 'LeRobot default'}")
+    print(f"Episodes to record: {NUM_EPISODES}")
+    print(f"Episode duration: {EPISODE_TIME_SEC}s")
+    print(f"FPS: {FPS}")
+    print()
+
+    # Create dual camera configuration (both cameras working!)
+    camera_config = {
+        "left": RealSenseCameraConfig(
+            serial_number_or_name=CAMERA_LEFT_SERIAL,  # D435i
+            fps=CAMERA_FPS,
+            width=CAMERA_WIDTH,
+            height=CAMERA_HEIGHT,
+            use_depth=USE_DEPTH,  # RGB-only
+        ),
+        "right": RealSenseCameraConfig(
+            serial_number_or_name=CAMERA_RIGHT_SERIAL,  # D435
+            fps=CAMERA_FPS,
+            width=CAMERA_WIDTH,
+            height=CAMERA_HEIGHT,
+            use_depth=USE_DEPTH,  # RGB-only
+        )
+    }
+
+    # Create follower configuration (with camera)
+    follower_config = SOFollowerRobotConfig(
+        port=FOLLOWER_PORT,
+        id="None",  # Uses None.json calibration
+        use_degrees=True,  # CRITICAL: FK/IK expects degrees!
+        cameras=camera_config,  # Attach camera to follower
+    )
+
+    # Create leader configuration
+    leader_config = SOLeaderTeleopConfig(
+        port=LEADER_PORT,
+        id="None",  # Uses None.json calibration
+        use_degrees=True,  # CRITICAL: FK/IK expects degrees!
+    )
+
+    # Initialize robots
+    print("Initializing robots...")
+    follower = SOFollower(follower_config)
+    leader = SOLeader(leader_config)
+
+    # Initialize kinematics solvers
+    print(f"Loading URDF: {URDF_PATH}")
+    follower_kinematics_solver = RobotKinematics(
+        urdf_path=URDF_PATH,
+        target_frame_name="gripper_frame_link",
+        joint_names=list(follower.bus.motors.keys()),
+    )
+    # Keep dataset FK separate from control IK because RobotKinematics mutates
+    # its underlying placo robot state on each FK/IK call.
+    follower_observation_kinematics_solver = RobotKinematics(
+        urdf_path=URDF_PATH,
+        target_frame_name="gripper_frame_link",
+        joint_names=list(follower.bus.motors.keys()),
+    )
+
+    leader_kinematics_solver = RobotKinematics(
+        urdf_path=URDF_PATH,
+        target_frame_name="gripper_frame_link",
+        joint_names=list(leader.bus.motors.keys()),
+    )
+
+    # Build processing pipelines
+    print("Setting up processing pipelines...")
+
+    # Pipeline: Follower joints -> EE observation (for dataset only)
+    follower_joints_to_ee = RobotProcessorPipeline[RobotObservation, RobotObservation](
+        steps=[
+            ForwardKinematicsJointsToEE(
+                kinematics=follower_observation_kinematics_solver,
+                motor_names=list(follower.bus.motors.keys())
+            ),
+        ],
+        to_transition=observation_to_transition,
+        to_output=transition_to_observation,
+    )
+
+    # Pipeline: Identity processor for observations (IK needs raw joints for control)
+    follower_observation_passthrough = RobotProcessorPipeline[RobotObservation, RobotObservation](
+        steps=[IdentityProcessorStep()],
+        to_transition=observation_to_transition,
+        to_output=transition_to_observation,
+    )
+
+    # Pipeline: Leader joints -> EE action. The stock record loop passes
+    # (teleop_action, robot_observation), but leader FK only needs the action.
+    leader_joints_to_ee = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
+        steps=[
+            ForwardKinematicsJointsToEE(
+                kinematics=leader_kinematics_solver,
+                motor_names=list(leader.bus.motors.keys())
+            ),
+        ],
+        to_transition=teleop_action_tuple_to_transition,
+        to_output=transition_to_robot_action,
+    )
+
+    # Pipeline: EE action -> Follower joints
+    ee_to_follower_joints = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
+        steps=[
+            EEBoundsAndSafety(
+                end_effector_bounds=EE_BOUNDS,
+                max_ee_step_m=MAX_EE_STEP_M,
+            ),
+            InverseKinematicsEEToJoints(
+                kinematics=follower_kinematics_solver,
+                motor_names=list(follower.bus.motors.keys()),
+                initial_guess_current_joints=False,  # CRITICAL: Avoids IK local minima!
+            ),
+        ],
+        to_transition=robot_action_observation_to_transition,
+        to_output=transition_to_robot_action,
+    )
+
+    # Create dataset
+    print(f"\nCreating dataset: {HF_REPO_ID}")
+    dataset = LeRobotDataset.create(
+        repo_id=HF_REPO_ID,
+        root=dataset_root,
+        fps=FPS,
+        features=combine_feature_dicts(
+            aggregate_pipeline_dataset_features(
+                pipeline=leader_joints_to_ee,
+                initial_features=create_initial_features(action=leader.action_features),
+                use_videos=True,
+            ),
+            aggregate_pipeline_dataset_features(
+                pipeline=follower_joints_to_ee,
+                initial_features=create_initial_features(observation=follower.observation_features),
+                use_videos=True,
+            ),
+        ),
+        robot_type=follower.name,
+        use_videos=True,
+        image_writer_threads=4,
+    )
+
+    # Connect to hardware
+    print("\nConnecting to hardware...")
+    print("  (This may take a few seconds)")
+    leader.connect()
+    print("  ✓ Leader connected")
+    follower.connect()
+    print("  ✓ Follower connected")
+    print("  ✓ Camera connected")
+
+    # Initialize keyboard listener
+    listener, events = init_keyboard_listener()
+
+    # Connect to Rerun viewer on remote desktop
+    # Note: Change the IP address to your desktop's IP if different
+    DESKTOP_IP = "192.168.88.101"  # ← CHANGE THIS to your desktop's IP address
+    print(f"\nConnecting to Rerun viewer at {DESKTOP_IP}:9876...")
+    try:
+        init_rerun(session_name="candy_picking_recording", ip=DESKTOP_IP, port=9876)
+        print("✓ Connected to Rerun viewer!")
+    except Exception as e:
+        print(f"⚠️  Could not connect to Rerun: {e}")
+        print("   Recording will continue without visualization.")
+
+    print("\n" + "=" * 60)
+    print("✓ READY TO RECORD")
+    print("=" * 60)
+    print()
+    print("Check your Rerun viewer on the desktop for live visualization!")
+    print()
+    print("⚠️  Note: Keyboard controls may not work in Docker.")
+    print("         Press Ctrl+C to stop recording safely.")
+    print()
+
+    try:
+        if not leader.is_connected or not follower.is_connected:
+            raise ValueError("Robot or teleop is not connected!")
+
+        episode_idx = 0
+        while episode_idx < NUM_EPISODES and not events["stop_recording"]:
+            print()
+            print("=" * 60)
+            print(f"🎬 Recording episode {episode_idx + 1} of {NUM_EPISODES}")
+            print("=" * 60)
+            print()
+            print("Instructions:")
+            print("  1. Move leader arm to demonstrate picking a candy")
+            print("  2. Follower will mimic your movements")
+            print("  3. Camera will record RGB-D frames")
+            print("  4. Press 's' when done to save episode")
+            print()
+            input("Press ENTER to start recording episode...")
+            print()
+            print("Recording... (move the leader arm now)")
+            print()
+
+            # Main record loop
+            record_loop(
+                robot=follower,
+                events=events,
+                fps=FPS,
+                teleop=leader,
+                dataset=dataset,
+                control_time_s=EPISODE_TIME_SEC,
+                single_task=TASK_DESCRIPTION,
+                display_data=True,  # Enable real-time visualization
+                teleop_action_processor=leader_joints_to_ee,
+                robot_action_processor=ee_to_follower_joints,
+                robot_observation_processor=follower_joints_to_ee,
+            )
+
+            # Handle episode completion
+            if events["rerecord_episode"]:
+                print("🔄 Re-recording episode")
+                events["rerecord_episode"] = False
+                events["exit_early"] = False
+                dataset.clear_episode_buffer()
+                continue
+
+            # Save episode
+            print()
+            print("Saving episode...")
+            dataset.save_episode()
+            print(f"✓ Episode {episode_idx + 1} saved!")
+            episode_idx += 1
+
+            # Reset environment between episodes
+            if not events["stop_recording"] and episode_idx < NUM_EPISODES:
+                print()
+                print("🔄 Reset the environment")
+                print(f"You have {RESET_TIME_SEC} seconds to reset the workspace")
+                print("  - Return arms to starting position")
+                print("  - Rearrange candies for next episode")
+                print()
+
+                record_loop(
+                    robot=follower,
+                    events=events,
+                    fps=FPS,
+                    teleop=leader,
+                    control_time_s=RESET_TIME_SEC,
+                    single_task=TASK_DESCRIPTION,
+                    display_data=True,
+                    teleop_action_processor=leader_joints_to_ee,
+                    robot_action_processor=ee_to_follower_joints,
+                    robot_observation_processor=follower_joints_to_ee,
+                )
+
+        print()
+        print("=" * 60)
+        print("✓ RECORDING COMPLETE!")
+        print("=" * 60)
+        print()
+        print(f"Total episodes recorded: {episode_idx}")
+        print(f"Dataset saved to: {HF_REPO_ID}")
+        print()
+        print("Next steps:")
+        print("  1. Inspect dataset quality: python replay.py")
+        print("  2. Upload to HuggingFace Hub (if not already)")
+        print("  3. Start training on desktop GPU")
+        print()
+
+    except KeyboardInterrupt:
+        print("\n\nRecording interrupted by user")
+    except Exception as e:
+        print(f"\n\nERROR during recording: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("\nStopping keyboard listener...")
+        try:
+            listener.stop()
+            print("✓ Keyboard listener stopped")
+        except Exception:
+            pass
+
+        print("\nDisconnecting hardware...")
+        try:
+            follower.disconnect()
+            print("✓ Follower disconnected")
+        except Exception:
+            pass
+        try:
+            leader.disconnect()
+            print("✓ Leader disconnected")
+        except Exception:
+            pass
+
+        print("\nFinalizing dataset...")
+        try:
+            dataset.finalize()
+            print("✓ Dataset finalized")
+        except Exception as e:
+            print(f"⚠️  Could not finalize dataset: {e}")
+        print()
+
+if __name__ == "__main__":
+    main()
