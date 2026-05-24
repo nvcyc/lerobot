@@ -18,6 +18,12 @@ Controls during recording:
 """
 
 import argparse
+import select
+import sys
+import termios
+import threading
+import tty
+from contextlib import contextmanager
 from pathlib import Path
 
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
@@ -44,7 +50,6 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
 from lerobot.scripts.lerobot_record import record_loop
 from lerobot.teleoperators.so_leader.config_so_leader import SOLeaderTeleopConfig
 from lerobot.teleoperators.so_leader.so_leader import SOLeader
-from lerobot.utils.control_utils import init_keyboard_listener
 # Text-to-speech not available in headless Docker - using print() instead
 # from lerobot.utils.utils import log_say
 from lerobot.utils.visualization_utils import init_rerun
@@ -111,6 +116,47 @@ def parse_args():
 def teleop_action_tuple_to_transition(action_observation: tuple[RobotAction, RobotObservation]):
     action, _observation = action_observation
     return robot_action_to_transition(action)
+
+
+@contextmanager
+def terminal_recording_controls(events: dict):
+    """Read single-key controls from the terminal without relying on pynput/X11."""
+    if not sys.stdin.isatty():
+        yield
+        return
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    stop = threading.Event()
+
+    def key_loop():
+        while not stop.is_set():
+            readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if not readable:
+                continue
+
+            key = sys.stdin.read(1).lower()
+            if key == "s":
+                print("\nEnding episode and saving...")
+                events["exit_early"] = True
+            elif key == "r":
+                print("\nRe-recording episode...")
+                events["rerecord_episode"] = True
+                events["exit_early"] = True
+            elif key == "q":
+                print("\nStopping recording...")
+                events["stop_recording"] = True
+                events["exit_early"] = True
+
+    try:
+        tty.setcbreak(fd)
+        thread = threading.Thread(target=key_loop, daemon=True)
+        thread.start()
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=0.2)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 def main():
@@ -271,8 +317,14 @@ def main():
     print("  ✓ Follower connected")
     print("  ✓ Camera connected")
 
-    # Initialize keyboard listener
-    listener, events = init_keyboard_listener()
+    # Terminal controls are handled locally because Docker may not expose an X11
+    # display for LeRobot's pynput-based keyboard listener.
+    listener = None
+    events = {
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+    }
 
     # Connect to Rerun viewer on remote desktop
     # Note: Change the IP address to your desktop's IP if different
@@ -291,8 +343,10 @@ def main():
     print()
     print("Check your Rerun viewer on the desktop for live visualization!")
     print()
-    print("⚠️  Note: Keyboard controls may not work in Docker.")
-    print("         Press Ctrl+C to stop recording safely.")
+    print("Terminal controls:")
+    print("  - Press 's' to finish and save the current episode")
+    print("  - Press 'r' to discard and re-record the current episode")
+    print("  - Press 'q' to stop recording after the current loop")
     print()
 
     try:
@@ -318,19 +372,20 @@ def main():
             print()
 
             # Main record loop
-            record_loop(
-                robot=follower,
-                events=events,
-                fps=FPS,
-                teleop=leader,
-                dataset=dataset,
-                control_time_s=EPISODE_TIME_SEC,
-                single_task=TASK_DESCRIPTION,
-                display_data=True,  # Enable real-time visualization
-                teleop_action_processor=leader_joints_to_ee,
-                robot_action_processor=ee_to_follower_joints,
-                robot_observation_processor=follower_joints_to_ee,
-            )
+            with terminal_recording_controls(events):
+                record_loop(
+                    robot=follower,
+                    events=events,
+                    fps=FPS,
+                    teleop=leader,
+                    dataset=dataset,
+                    control_time_s=EPISODE_TIME_SEC,
+                    single_task=TASK_DESCRIPTION,
+                    display_data=True,  # Enable real-time visualization
+                    teleop_action_processor=leader_joints_to_ee,
+                    robot_action_processor=ee_to_follower_joints,
+                    robot_observation_processor=follower_joints_to_ee,
+                )
 
             # Handle episode completion
             if events["rerecord_episode"]:
@@ -390,12 +445,13 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
-        print("\nStopping keyboard listener...")
-        try:
-            listener.stop()
-            print("✓ Keyboard listener stopped")
-        except Exception:
-            pass
+        if listener is not None:
+            print("\nStopping keyboard listener...")
+            try:
+                listener.stop()
+                print("✓ Keyboard listener stopped")
+            except Exception:
+                pass
 
         print("\nDisconnecting hardware...")
         try:
