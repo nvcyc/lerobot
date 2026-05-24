@@ -864,19 +864,48 @@ class SerialMotorsBus(MotorsBusBase):
             if max_ == min_:
                 raise ValueError(f"Invalid calibration for motor '{motor}': min and max are equal.")
 
-            bounded_val = min(max_, max(min_, val))
-            if self.motors[motor].norm_mode is MotorNormMode.RANGE_M100_100:
-                norm = (((bounded_val - min_) / (max_ - min_)) * 200) - 100
-                normalized_values[id_] = -norm if drive_mode else norm
-            elif self.motors[motor].norm_mode is MotorNormMode.RANGE_0_100:
-                norm = ((bounded_val - min_) / (max_ - min_)) * 100
-                normalized_values[id_] = 100 - norm if drive_mode else norm
-            elif self.motors[motor].norm_mode is MotorNormMode.DEGREES:
-                mid = (min_ + max_) / 2
-                max_res = self.model_resolution_table[self._id_to_model(id_)] - 1
-                normalized_values[id_] = (val - mid) * 360 / max_res
-            else:
-                raise NotImplementedError
+            # Handle wrapping case where calibration range crosses 0/max boundary
+            if min_ > max_:  # Calibration wraps around boundary
+                max_res = self.model_resolution_table[self._id_to_model(id_)]
+
+                # Unwrap the value into a continuous range
+                if val <= max_:
+                    # Value is in [0, max_] - treat as wrapped (add max_res)
+                    unwrapped_val = val + max_res
+                else:
+                    # Value is in [min_, max_res-1] - no adjustment needed
+                    unwrapped_val = val
+
+                # Bound to unwrapped range
+                bounded_val = min(min_ + max_res, max(min_, unwrapped_val))
+                unwrapped_range = (max_ + max_res) - min_
+
+                if self.motors[motor].norm_mode is MotorNormMode.RANGE_M100_100:
+                    norm = (((bounded_val - min_) / unwrapped_range) * 200) - 100
+                    normalized_values[id_] = -norm if drive_mode else norm
+                elif self.motors[motor].norm_mode is MotorNormMode.RANGE_0_100:
+                    norm = ((bounded_val - min_) / unwrapped_range) * 100
+                    normalized_values[id_] = 100 - norm if drive_mode else norm
+                elif self.motors[motor].norm_mode is MotorNormMode.DEGREES:
+                    mid = min_ + (unwrapped_range / 2)
+                    normalized_values[id_] = (bounded_val - mid) * 360 / (max_res - 1)
+                else:
+                    raise NotImplementedError
+
+            else:  # Normal case (no wrapping)
+                bounded_val = min(max_, max(min_, val))
+                if self.motors[motor].norm_mode is MotorNormMode.RANGE_M100_100:
+                    norm = (((bounded_val - min_) / (max_ - min_)) * 200) - 100
+                    normalized_values[id_] = -norm if drive_mode else norm
+                elif self.motors[motor].norm_mode is MotorNormMode.RANGE_0_100:
+                    norm = ((bounded_val - min_) / (max_ - min_)) * 100
+                    normalized_values[id_] = 100 - norm if drive_mode else norm
+                elif self.motors[motor].norm_mode is MotorNormMode.DEGREES:
+                    mid = (min_ + max_) / 2
+                    max_res = self.model_resolution_table[self._id_to_model(id_)] - 1
+                    normalized_values[id_] = (val - mid) * 360 / max_res
+                else:
+                    raise NotImplementedError
 
         return normalized_values
 
