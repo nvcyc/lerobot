@@ -24,27 +24,33 @@ import termios
 import threading
 import tty
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+from scipy.spatial.transform import Rotation
+
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
+from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
 from lerobot.datasets.utils import combine_feature_dicts
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.processor import RobotAction, RobotObservation, RobotProcessorPipeline
+from lerobot.processor.core import TransitionKey
 from lerobot.processor.converters import (
     observation_to_transition,
     robot_action_observation_to_transition,
-    robot_action_to_transition,
     transition_to_observation,
     transition_to_robot_action,
 )
-from lerobot.processor.pipeline import IdentityProcessorStep
+from lerobot.processor.pipeline import IdentityProcessorStep, RobotActionProcessorStep
 from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
 from lerobot.robots.so_follower.so_follower import SOFollower
 from lerobot.robots.so_follower.robot_kinematic_processor import (
     EEBoundsAndSafety,
-    ForwardKinematicsJointsToEE,
+    ForwardKinematicsJointsToEEAction,
+    ForwardKinematicsJointsToEEObservation,
     InverseKinematicsEEToJoints,
 )
 from lerobot.scripts.lerobot_record import record_loop
@@ -64,7 +70,7 @@ FPS = 30  # Control frequency (Hz)
 EPISODE_TIME_SEC = 30  # Max time per episode (seconds)
 RESET_TIME_SEC = 10  # Time to reset environment between episodes
 TASK_DESCRIPTION = "Pick colored candy and place in front of person"
-HF_REPO_ID = "local/candy-picking-v1"  # Local storage (no upload)
+HF_REPO_ID = "local/candy-picking-relative-v1"  # Local storage (no upload)
 
 # Hardware ports
 FOLLOWER_PORT = "/dev/ttyACM0"  # Robot arm doing the task
@@ -96,6 +102,17 @@ MAX_EE_STEP_M = 0.05  # Max end-effector movement per step (5cm)
 # MAIN RECORDING SCRIPT
 # ============================================================================
 
+ABSOLUTE_EE_KEYS = ["x", "y", "z", "wx", "wy", "wz", "gripper_pos"]
+DELTA_EE_KEYS = ["delta_x", "delta_y", "delta_z", "delta_wx", "delta_wy", "delta_wz", "delta_gripper_pos"]
+RELATIVE_EE_ACTION_DATASET_FEATURE = {
+    "action": {
+        "dtype": "float32",
+        "shape": (len(DELTA_EE_KEYS),),
+        "names": [f"ee.{key}" for key in DELTA_EE_KEYS],
+    }
+}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Record candy-picking demonstrations with SO-ARM100 leader-follower teleoperation."
@@ -113,9 +130,106 @@ def parse_args():
     return parser.parse_args()
 
 
-def teleop_action_tuple_to_transition(action_observation: tuple[RobotAction, RobotObservation]):
-    action, _observation = action_observation
-    return robot_action_to_transition(action)
+def _current_ee_from_observation(
+    observation: RobotObservation, kinematics: RobotKinematics, motor_names: list[str]
+) -> dict[str, float]:
+    joint_values = np.array([float(observation[f"{name}.pos"]) for name in motor_names], dtype=float)
+    transform = kinematics.forward_kinematics(joint_values)
+    pos = transform[:3, 3]
+    rotvec = Rotation.from_matrix(transform[:3, :3]).as_rotvec()
+
+    return {
+        "ee.x": float(pos[0]),
+        "ee.y": float(pos[1]),
+        "ee.z": float(pos[2]),
+        "ee.wx": float(rotvec[0]),
+        "ee.wy": float(rotvec[1]),
+        "ee.wz": float(rotvec[2]),
+        "ee.gripper_pos": float(observation["gripper.pos"]),
+    }
+
+
+@dataclass
+class AbsoluteEEToRelativeDelta(RobotActionProcessorStep):
+    """Convert an absolute EE target into deltas from the follower's current EE pose."""
+
+    kinematics: RobotKinematics
+    motor_names: list[str]
+
+    def action(self, action: RobotAction) -> RobotAction:
+        observation = self.transition.get(TransitionKey.OBSERVATION)
+        if observation is None:
+            raise ValueError("Observation is required to compute relative end-effector deltas.")
+
+        current = _current_ee_from_observation(observation, self.kinematics, self.motor_names)
+
+        current_rot = Rotation.from_rotvec([current["ee.wx"], current["ee.wy"], current["ee.wz"]])
+        target_rot = Rotation.from_rotvec([action["ee.wx"], action["ee.wy"], action["ee.wz"]])
+        delta_rot = target_rot * current_rot.inv()
+        delta_rotvec = delta_rot.as_rotvec()
+
+        return {
+            "ee.delta_x": float(action["ee.x"] - current["ee.x"]),
+            "ee.delta_y": float(action["ee.y"] - current["ee.y"]),
+            "ee.delta_z": float(action["ee.z"] - current["ee.z"]),
+            "ee.delta_wx": float(delta_rotvec[0]),
+            "ee.delta_wy": float(delta_rotvec[1]),
+            "ee.delta_wz": float(delta_rotvec[2]),
+            "ee.delta_gripper_pos": float(action["ee.gripper_pos"] - current["ee.gripper_pos"]),
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        for key in ABSOLUTE_EE_KEYS:
+            features[PipelineFeatureType.ACTION].pop(f"ee.{key}", None)
+        for key in DELTA_EE_KEYS:
+            features[PipelineFeatureType.ACTION][f"ee.{key}"] = PolicyFeature(
+                type=FeatureType.ACTION, shape=(1,)
+            )
+        return features
+
+
+@dataclass
+class RelativeDeltaToAbsoluteEE(RobotActionProcessorStep):
+    """Convert recorded/predicted EE deltas back into an absolute EE target for IK."""
+
+    kinematics: RobotKinematics
+    motor_names: list[str]
+
+    def action(self, action: RobotAction) -> RobotAction:
+        observation = self.transition.get(TransitionKey.OBSERVATION)
+        if observation is None:
+            raise ValueError("Observation is required to reconstruct an absolute end-effector target.")
+
+        current = _current_ee_from_observation(observation, self.kinematics, self.motor_names)
+
+        current_rot = Rotation.from_rotvec([current["ee.wx"], current["ee.wy"], current["ee.wz"]])
+        delta_rot = Rotation.from_rotvec(
+            [action["ee.delta_wx"], action["ee.delta_wy"], action["ee.delta_wz"]]
+        )
+        target_rotvec = (delta_rot * current_rot).as_rotvec()
+
+        return {
+            "ee.x": float(current["ee.x"] + action["ee.delta_x"]),
+            "ee.y": float(current["ee.y"] + action["ee.delta_y"]),
+            "ee.z": float(current["ee.z"] + action["ee.delta_z"]),
+            "ee.wx": float(target_rotvec[0]),
+            "ee.wy": float(target_rotvec[1]),
+            "ee.wz": float(target_rotvec[2]),
+            "ee.gripper_pos": float(current["ee.gripper_pos"] + action["ee.delta_gripper_pos"]),
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        for key in DELTA_EE_KEYS:
+            features[PipelineFeatureType.ACTION].pop(f"ee.{key}", None)
+        for key in ABSOLUTE_EE_KEYS:
+            features[PipelineFeatureType.ACTION][f"ee.{key}"] = PolicyFeature(
+                type=FeatureType.ACTION, shape=(1,)
+            )
+        return features
 
 
 @contextmanager
@@ -226,6 +340,16 @@ def main():
         target_frame_name="gripper_frame_link",
         joint_names=list(follower.bus.motors.keys()),
     )
+    follower_relative_action_kinematics_solver = RobotKinematics(
+        urdf_path=URDF_PATH,
+        target_frame_name="gripper_frame_link",
+        joint_names=list(follower.bus.motors.keys()),
+    )
+    follower_delta_control_kinematics_solver = RobotKinematics(
+        urdf_path=URDF_PATH,
+        target_frame_name="gripper_frame_link",
+        joint_names=list(follower.bus.motors.keys()),
+    )
 
     leader_kinematics_solver = RobotKinematics(
         urdf_path=URDF_PATH,
@@ -239,7 +363,7 @@ def main():
     # Pipeline: Follower joints -> EE observation (for dataset only)
     follower_joints_to_ee = RobotProcessorPipeline[RobotObservation, RobotObservation](
         steps=[
-            ForwardKinematicsJointsToEE(
+            ForwardKinematicsJointsToEEObservation(
                 kinematics=follower_observation_kinematics_solver,
                 motor_names=list(follower.bus.motors.keys())
             ),
@@ -255,22 +379,31 @@ def main():
         to_output=transition_to_observation,
     )
 
-    # Pipeline: Leader joints -> EE action. The stock record loop passes
-    # (teleop_action, robot_observation), but leader FK only needs the action.
-    leader_joints_to_ee = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
+    # Pipeline: Leader joints -> absolute EE target -> relative EE delta action.
+    # The dataset stores deltas from the follower's current EE pose while the
+    # follower still executes the same absolute target after reconstruction.
+    leader_joints_to_relative_ee = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
         steps=[
-            ForwardKinematicsJointsToEE(
+            ForwardKinematicsJointsToEEAction(
                 kinematics=leader_kinematics_solver,
                 motor_names=list(leader.bus.motors.keys())
             ),
+            AbsoluteEEToRelativeDelta(
+                kinematics=follower_relative_action_kinematics_solver,
+                motor_names=list(follower.bus.motors.keys()),
+            ),
         ],
-        to_transition=teleop_action_tuple_to_transition,
+        to_transition=robot_action_observation_to_transition,
         to_output=transition_to_robot_action,
     )
 
-    # Pipeline: EE action -> Follower joints
-    ee_to_follower_joints = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
+    # Pipeline: relative EE delta action -> absolute EE target -> Follower joints
+    relative_ee_to_follower_joints = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
         steps=[
+            RelativeDeltaToAbsoluteEE(
+                kinematics=follower_delta_control_kinematics_solver,
+                motor_names=list(follower.bus.motors.keys()),
+            ),
             EEBoundsAndSafety(
                 end_effector_bounds=EE_BOUNDS,
                 max_ee_step_m=MAX_EE_STEP_M,
@@ -292,11 +425,7 @@ def main():
         root=dataset_root,
         fps=FPS,
         features=combine_feature_dicts(
-            aggregate_pipeline_dataset_features(
-                pipeline=leader_joints_to_ee,
-                initial_features=create_initial_features(action=leader.action_features),
-                use_videos=True,
-            ),
+            RELATIVE_EE_ACTION_DATASET_FEATURE,
             aggregate_pipeline_dataset_features(
                 pipeline=follower_joints_to_ee,
                 initial_features=create_initial_features(observation=follower.observation_features),
@@ -371,6 +500,9 @@ def main():
             print("Recording... (move the leader arm now)")
             print()
 
+            leader_joints_to_relative_ee.reset()
+            relative_ee_to_follower_joints.reset()
+
             # Main record loop
             with terminal_recording_controls(events):
                 record_loop(
@@ -382,8 +514,8 @@ def main():
                     control_time_s=EPISODE_TIME_SEC,
                     single_task=TASK_DESCRIPTION,
                     display_data=True,  # Enable real-time visualization
-                    teleop_action_processor=leader_joints_to_ee,
-                    robot_action_processor=ee_to_follower_joints,
+                    teleop_action_processor=leader_joints_to_relative_ee,
+                    robot_action_processor=relative_ee_to_follower_joints,
                     robot_observation_processor=follower_joints_to_ee,
                 )
 
@@ -393,6 +525,8 @@ def main():
                 events["rerecord_episode"] = False
                 events["exit_early"] = False
                 dataset.clear_episode_buffer()
+                leader_joints_to_relative_ee.reset()
+                relative_ee_to_follower_joints.reset()
                 continue
 
             # Save episode
@@ -411,6 +545,9 @@ def main():
                 print("  - Rearrange candies for next episode")
                 print()
 
+                leader_joints_to_relative_ee.reset()
+                relative_ee_to_follower_joints.reset()
+
                 record_loop(
                     robot=follower,
                     events=events,
@@ -419,8 +556,8 @@ def main():
                     control_time_s=RESET_TIME_SEC,
                     single_task=TASK_DESCRIPTION,
                     display_data=True,
-                    teleop_action_processor=leader_joints_to_ee,
-                    robot_action_processor=ee_to_follower_joints,
+                    teleop_action_processor=leader_joints_to_relative_ee,
+                    robot_action_processor=relative_ee_to_follower_joints,
                     robot_observation_processor=follower_joints_to_ee,
                 )
 
