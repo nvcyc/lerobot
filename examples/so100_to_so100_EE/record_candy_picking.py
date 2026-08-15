@@ -34,10 +34,10 @@ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraCon
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
-from lerobot.datasets.utils import combine_feature_dicts
+from lerobot.utils.feature_utils import combine_feature_dicts
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.processor import RobotAction, RobotObservation, RobotProcessorPipeline
-from lerobot.processor.core import TransitionKey
+from lerobot.lerobot_types import TransitionKey
 from lerobot.processor.converters import (
     observation_to_transition,
     robot_action_observation_to_transition,
@@ -126,6 +126,32 @@ def parse_args():
             "When set, this dataset is stored under <dataset-location>/<repo-id>. "
             "When omitted, LeRobot's default cache location is used."
         ),
+    )
+    parser.add_argument(
+        "--id",
+        default="None",
+        help="Calibration ID saved by arm.sh calibrate (e.g. orangebean). Default: None",
+    )
+    parser.add_argument(
+        "--follower-port",
+        default=FOLLOWER_PORT,
+        help=f"Serial port for the follower arm. Default: {FOLLOWER_PORT}",
+    )
+    parser.add_argument(
+        "--leader-port",
+        default=LEADER_PORT,
+        help=f"Serial port for the leader arm. Default: {LEADER_PORT}",
+    )
+    parser.add_argument(
+        "--repo-id",
+        default=HF_REPO_ID,
+        help=f"Dataset repo id to record into. Default: {HF_REPO_ID}",
+    )
+    parser.add_argument(
+        "--num-episodes",
+        type=int,
+        default=NUM_EPISODES,
+        help=f"Number of episodes to record. Default: {NUM_EPISODES}",
     )
     return parser.parse_args()
 
@@ -275,15 +301,18 @@ def terminal_recording_controls(events: dict):
 
 def main():
     args = parse_args()
-    dataset_root = args.dataset_location / HF_REPO_ID if args.dataset_location is not None else None
+    repo_id = args.repo_id
+    num_episodes = args.num_episodes
+    dataset_root = args.dataset_location / repo_id if args.dataset_location is not None else None
 
     print("\n" + "=" * 60)
     print("SO-ARM100 Candy-Picking Data Collection")
     print("=" * 60)
     print()
-    print(f"Target dataset: {HF_REPO_ID}")
+    print(f"Target dataset: {repo_id}")
     print(f"Dataset location: {dataset_root if dataset_root is not None else 'LeRobot default'}")
-    print(f"Episodes to record: {NUM_EPISODES}")
+    print(f"Calibration ID: {args.id}")
+    print(f"Episodes to record: {num_episodes}")
     print(f"Episode duration: {EPISODE_TIME_SEC}s")
     print(f"FPS: {FPS}")
     print()
@@ -308,16 +337,16 @@ def main():
 
     # Create follower configuration (with camera)
     follower_config = SOFollowerRobotConfig(
-        port=FOLLOWER_PORT,
-        id="None",  # Uses None.json calibration
+        port=args.follower_port,
+        id=args.id,  # Uses <id>.json calibration
         use_degrees=True,  # CRITICAL: FK/IK expects degrees!
         cameras=camera_config,  # Attach camera to follower
     )
 
     # Create leader configuration
     leader_config = SOLeaderTeleopConfig(
-        port=LEADER_PORT,
-        id="None",  # Uses None.json calibration
+        port=args.leader_port,
+        id=args.id,  # Uses <id>.json calibration
         use_degrees=True,  # CRITICAL: FK/IK expects degrees!
     )
 
@@ -419,9 +448,9 @@ def main():
     )
 
     # Create dataset
-    print(f"\nCreating dataset: {HF_REPO_ID}")
+    print(f"\nCreating dataset: {repo_id}")
     dataset = LeRobotDataset.create(
-        repo_id=HF_REPO_ID,
+        repo_id=repo_id,
         root=dataset_root,
         fps=FPS,
         features=combine_feature_dicts(
@@ -483,10 +512,10 @@ def main():
             raise ValueError("Robot or teleop is not connected!")
 
         episode_idx = 0
-        while episode_idx < NUM_EPISODES and not events["stop_recording"]:
+        while episode_idx < num_episodes and not events["stop_recording"]:
             print()
             print("=" * 60)
-            print(f"🎬 Recording episode {episode_idx + 1} of {NUM_EPISODES}")
+            print(f"🎬 Recording episode {episode_idx + 1} of {num_episodes}")
             print("=" * 60)
             print()
             print("Instructions:")
@@ -537,7 +566,7 @@ def main():
             episode_idx += 1
 
             # Reset environment between episodes
-            if not events["stop_recording"] and episode_idx < NUM_EPISODES:
+            if not events["stop_recording"] and episode_idx < num_episodes:
                 print()
                 print("🔄 Reset the environment")
                 print(f"You have {RESET_TIME_SEC} seconds to reset the workspace")
@@ -567,7 +596,7 @@ def main():
         print("=" * 60)
         print()
         print(f"Total episodes recorded: {episode_idx}")
-        print(f"Dataset saved to: {HF_REPO_ID}")
+        print(f"Dataset saved to: {repo_id}")
         print()
         print("Next steps:")
         print("  1. Inspect dataset quality: python replay.py")
