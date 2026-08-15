@@ -221,7 +221,13 @@ def visualize_dataset(
     gc.collect()
 
     if mode == "distant":
-        server_uri = rr.serve_grpc(grpc_port=grpc_port)
+        # The web viewer is served on one port and streams data from the gRPC
+        # port, so a browser treats them as separate origins. Without an
+        # `access-control-allow-origin` header the fetch is blocked and the
+        # viewer reports "failed to fetch". Passing cors_allow_origin makes
+        # rerun echo the requesting origin back, which also covers the remote
+        # case where the browser is on a different machine entirely.
+        server_uri = rr.serve_grpc(grpc_port=grpc_port, cors_allow_origin=["*"])
         logging.info(f"Connect to a Rerun Server: rerun rerun+http://IP:{grpc_port}/proxy")
         rr.serve_web_viewer(
             open_browser=False,
