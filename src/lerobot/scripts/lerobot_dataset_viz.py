@@ -159,7 +159,7 @@ def build_blueprint_from_dataset(dataset: LeRobotDataset):
 
 def visualize_dataset(
     dataset: LeRobotDataset,
-    episode_index: int,
+    episode_index: int | list[int],
     batch_size: int = 32,
     num_workers: int = 0,
     mode: str = "local",
@@ -171,15 +171,31 @@ def visualize_dataset(
     display_mode: str = "rerun",
     host: str = "127.0.0.1",
     autoplay: bool = True,
+    server_memory_limit: str = "1GiB",
     **kwargs,
 ) -> Path | None:
+    # `episode_index` may be a single index or a list of them. Keep both forms:
+    # the list drives the dataset, a representative scalar names the recording.
+    episode_indices = [episode_index] if isinstance(episode_index, int) else list(episode_index)
+    first_episode = episode_indices[0]
+    if len(episode_indices) == 1:
+        episode_label = f"episode_{first_episode}"
+    else:
+        episode_label = f"episodes_{min(episode_indices)}-{max(episode_indices)}"
+
     if display_mode == "foxglove":
         from lerobot.utils.foxglove_visualization import serve_foxglove_dataset_playback
 
+        if len(episode_indices) > 1:
+            logging.warning(
+                "Foxglove playback handles one episode at a time; showing episode %d. "
+                "Use --display-mode rerun to see several at once.",
+                first_episode,
+            )
         logging.info("Starting Foxglove server")
         serve_foxglove_dataset_playback(
             dataset,
-            episode_index,
+            first_episode,
             host=host,
             port=web_port if web_port is not None else DEFAULT_FOXGLOVE_PORT,
             compress_images=display_compressed_images,
@@ -213,7 +229,7 @@ def visualize_dataset(
 
     spawn_local_viewer = mode == "local" and not save
     blueprint = build_blueprint_from_dataset(dataset)
-    rr.init(f"{repo_id}/episode_{episode_index}", spawn=spawn_local_viewer, default_blueprint=blueprint)
+    rr.init(f"{repo_id}/{episode_label}", spawn=spawn_local_viewer, default_blueprint=blueprint)
 
     # Manually call python garbage collector after `rr.init` to avoid hanging in a blocking flush
     # when iterating on a dataloader with `num_workers` > 0
@@ -227,7 +243,11 @@ def visualize_dataset(
         # viewer reports "failed to fetch". Passing cors_allow_origin makes
         # rerun echo the requesting origin back, which also covers the remote
         # case where the browser is on a different machine entirely.
-        server_uri = rr.serve_grpc(grpc_port=grpc_port, cors_allow_origin=["*"])
+        server_uri = rr.serve_grpc(
+            grpc_port=grpc_port,
+            cors_allow_origin=["*"],
+            server_memory_limit=server_memory_limit,
+        )
         logging.info(f"Connect to a Rerun Server: rerun rerun+http://IP:{grpc_port}/proxy")
         rr.serve_web_viewer(
             open_browser=False,
@@ -297,7 +317,7 @@ def visualize_dataset(
     if mode == "local" and save:
         output_dir.mkdir(parents=True, exist_ok=True)
         repo_id_str = repo_id.replace("/", "_")
-        rrd_path = output_dir / f"{repo_id_str}_episode_{episode_index}.rrd"
+        rrd_path = output_dir / f"{repo_id_str}_{episode_label}.rrd"
         rr.save(rrd_path)
         return rrd_path
 
@@ -322,8 +342,12 @@ def main():
     parser.add_argument(
         "--episode-index",
         type=int,
+        nargs="+",
         required=True,
-        help="Episode to visualize.",
+        help=(
+            "Episode(s) to visualize. Accepts several indices "
+            "(e.g. `--episode-index 0 1 2`), which are shown on one timeline."
+        ),
     )
     parser.add_argument(
         "--root",
@@ -374,6 +398,16 @@ def main():
         type=int,
         default=9876,
         help="gRPC port for rerun.io when `--mode distant` is set.",
+    )
+    parser.add_argument(
+        "--server-memory-limit",
+        type=str,
+        default="1GiB",
+        help=(
+            "Memory budget for the rerun server when `--mode distant` is set. "
+            "Older data is dropped once this is exceeded, so raise it when "
+            "visualizing many episodes at once (e.g. `4GiB`)."
+        ),
     )
     parser.add_argument(
         "--save",
@@ -436,7 +470,15 @@ def main():
     args = parser.parse_args()
 
     if args.display_mode == "foxglove":
-        rerun_only = ("mode", "save", "output_dir", "grpc_port", "batch_size", "num_workers")
+        rerun_only = (
+            "mode",
+            "save",
+            "output_dir",
+            "grpc_port",
+            "batch_size",
+            "num_workers",
+            "server_memory_limit",
+        )
         ignored = [name for name in rerun_only if getattr(args, name) != parser.get_default(name)]
         if ignored:
             logging.warning(
@@ -452,7 +494,7 @@ def main():
 
     init_logging()
     logging.info("Loading dataset")
-    dataset = LeRobotDataset(repo_id, episodes=[args.episode_index], root=root, tolerance_s=tolerance_s)
+    dataset = LeRobotDataset(repo_id, episodes=args.episode_index, root=root, tolerance_s=tolerance_s)
 
     visualize_dataset(dataset, **kwargs)
 
