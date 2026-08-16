@@ -58,7 +58,7 @@ from lerobot.teleoperators.so_leader.config_so_leader import SOLeaderTeleopConfi
 from lerobot.teleoperators.so_leader.so_leader import SOLeader
 # Text-to-speech not available in headless Docker - using print() instead
 # from lerobot.utils.utils import log_say
-from lerobot.utils.visualization_utils import init_rerun
+from lerobot.utils.visualization_utils import init_visualization
 
 # ============================================================================
 # CONFIGURATION - Customize these values
@@ -153,7 +153,32 @@ def parse_args():
         default=NUM_EPISODES,
         help=f"Number of episodes to record. Default: {NUM_EPISODES}",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--display-mode",
+        choices=["foxglove", "rerun", "none"],
+        default="foxglove",
+        help=(
+            "Live visualization while recording. 'foxglove' serves a WebSocket "
+            "you can open in a browser; 'rerun' pushes to a Rerun viewer "
+            "already running at --display-ip; 'none' disables it. "
+            "Default: foxglove"
+        ),
+    )
+    parser.add_argument(
+        "--display-ip",
+        default="192.168.88.101",
+        help="Address of an existing Rerun viewer, for --display-mode rerun.",
+    )
+    parser.add_argument(
+        "--display-port",
+        type=int,
+        default=None,
+        help="Port for live visualization. Default: 8765 (foxglove) / 9876 (rerun).",
+    )
+    args = parser.parse_args()
+    if args.display_port is None:
+        args.display_port = 8765 if args.display_mode == "foxglove" else 9876
+    return args
 
 
 def _current_ee_from_observation(
@@ -484,22 +509,38 @@ def main():
         "stop_recording": False,
     }
 
-    # Connect to Rerun viewer on remote desktop
-    # Note: Change the IP address to your desktop's IP if different
-    DESKTOP_IP = "192.168.88.101"  # ← CHANGE THIS to your desktop's IP address
-    print(f"\nConnecting to Rerun viewer at {DESKTOP_IP}:9876...")
-    try:
-        init_rerun(session_name="candy_picking_recording", ip=DESKTOP_IP, port=9876)
-        print("✓ Connected to Rerun viewer!")
-    except Exception as e:
-        print(f"⚠️  Could not connect to Rerun: {e}")
-        print("   Recording will continue without visualization.")
+    # Live visualization. The cameras are held by this process, so a separate
+    # viewer cannot open them -- the frames have to be published from here.
+    # "foxglove" serves a WebSocket anyone on the LAN can open in a browser;
+    # "rerun" pushes to a Rerun viewer already running at --display-ip.
+    display_mode = args.display_mode
+    if display_mode != "none":
+        try:
+            if display_mode == "foxglove":
+                init_visualization(
+                    "foxglove",
+                    session_name="candy_picking_recording",
+                    ip="0.0.0.0",
+                    port=args.display_port,
+                )
+                print(f"\n✓ Live camera streams at ws://<this-host>:{args.display_port}")
+                print("  Open https://app.foxglove.dev and connect to that address.")
+            else:
+                init_visualization(
+                    "rerun",
+                    session_name="candy_picking_recording",
+                    ip=args.display_ip,
+                    port=args.display_port,
+                )
+                print(f"\n✓ Streaming to Rerun viewer at {args.display_ip}:{args.display_port}")
+        except Exception as e:
+            print(f"⚠️  Could not start live visualization: {e}")
+            print("   Recording will continue without it.")
+            display_mode = "none"
 
     print("\n" + "=" * 60)
     print("✓ READY TO RECORD")
     print("=" * 60)
-    print()
-    print("Check your Rerun viewer on the desktop for live visualization!")
     print()
     print("Terminal controls:")
     print("  - Press 's' to finish and save the current episode")
@@ -542,7 +583,8 @@ def main():
                     dataset=dataset,
                     control_time_s=EPISODE_TIME_SEC,
                     single_task=TASK_DESCRIPTION,
-                    display_data=True,  # Enable real-time visualization
+                    display_data=display_mode != "none",
+                    display_mode=display_mode if display_mode != "none" else "rerun",
                     teleop_action_processor=leader_joints_to_relative_ee,
                     robot_action_processor=relative_ee_to_follower_joints,
                     robot_observation_processor=follower_joints_to_ee,
@@ -584,7 +626,8 @@ def main():
                     teleop=leader,
                     control_time_s=RESET_TIME_SEC,
                     single_task=TASK_DESCRIPTION,
-                    display_data=True,
+                    display_data=display_mode != "none",
+                    display_mode=display_mode if display_mode != "none" else "rerun",
                     teleop_action_processor=leader_joints_to_relative_ee,
                     robot_action_processor=relative_ee_to_follower_joints,
                     robot_observation_processor=follower_joints_to_ee,
