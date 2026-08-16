@@ -123,11 +123,19 @@ class InteractiveSession:
         self.controller = RolloutController(strategy, ctx, on_event=self._on_event)
         self._runtime = ctx.runtime
         self._play_sounds = ctx.runtime.cfg.play_sounds
-        self._listener = StdinCommandListener(self._handle_line, on_eof=self._handle_eof, stream=input_stream)
+        # forward_blank_lines: a bare Enter toggles the robot between running and halted, which
+        # is faster to hit than typing /stop when something is going wrong.
+        self._listener = StdinCommandListener(
+            self._handle_line,
+            on_eof=self._handle_eof,
+            stream=input_stream,
+            forward_blank_lines=True,
+        )
 
         # name -> (handler, argument hint, help line); /help and the banner render from this table.
         self._commands: dict[str, tuple[Callable[[InteractiveCommand], None], str, str]] = {
             "start": (self._cmd_start, "", "start (or restart) the policy control loop"),
+            "halt": (self._cmd_halt, "", "stop the arm where it is, without homing (same as Enter)"),
             "subtask": (self._cmd_subtask, " <text>", "set the instruction the policy follows"),
             "vqa": (self._cmd_vqa, " <text>", "ask the policy a question about what it sees"),
             "autosteer": (
@@ -178,7 +186,8 @@ class InteractiveSession:
             log_say("Starting rollout", self._play_sounds)
             self._print(
                 f"Rollout running — task {_format_task(self.controller.task)}. "
-                "/subtask <text> to change it, /reset to return to initial position, /stop to shut down."
+                "PRESS ENTER to halt. /subtask <text> to change the task, "
+                "/reset to return to initial position, /stop to shut down."
             )
         elif event is RolloutEvent.SEGMENT_ENDED:
             self._print(
@@ -232,6 +241,11 @@ class InteractiveSession:
     # ------------------------------------------------------------------
 
     def _handle_line(self, line: str) -> None:
+        # A bare Enter toggles between running and halted. Kept ahead of command parsing so it
+        # stays the shortest possible path from "something is wrong" to "the arm stopped".
+        if not line.strip():
+            self._toggle_running()
+            return
         cmd = parse_command(line)
         if cmd is None:
             self._print("Input not recognized — commands start with '/'. Type /help for the list.")
@@ -246,6 +260,30 @@ class InteractiveSession:
     def _handle_eof(self) -> None:
         self._print("Input stream closed — stopping the session.")
         self.controller.stop()
+
+    def _toggle_running(self) -> None:
+        """Enter: halt a running robot, or resume a halted one."""
+        if self.controller.running:
+            if self.controller.pause():
+                self._print("HALTED — arm holding position. Press Enter to resume, /stop to shut down.")
+            else:
+                self._print("Can't halt — the session is stopping or has failed.")
+            return
+        if self.controller.start():
+            self._print("RUNNING — press Enter to halt.")
+            return
+        if self.controller.stopped or self.controller.failed:
+            self._print("Can't start — the session is stopping or has failed.")
+        else:
+            self._print("Can't start right now.")
+
+    def _cmd_halt(self, cmd: InteractiveCommand) -> None:
+        if self.controller.pause():
+            self._print("HALTED — arm holding position. Press Enter to resume.")
+        elif self.controller.running:
+            self._print("Can't halt — the session is stopping or has failed.")
+        else:
+            self._print("Already halted.")
 
     def _cmd_start(self, cmd: InteractiveCommand) -> None:
         if self.controller.start():
@@ -353,7 +391,8 @@ class InteractiveSession:
     def _render_banner(self) -> str:
         return (
             f"{_BANNER_RULE}\n"
-            "Interactive rollout session — the robot will NOT move until you type /start.\n"
+            "Interactive rollout session — the robot will NOT move until you start it.\n"
+            "PRESS ENTER to start; press ENTER again at any time to halt the arm where it is.\n"
             f"Task: {_format_task(self.controller.initial_task)}\n"
             f"{self._render_help()}\n"
             "Routine system logs and warnings are muted during the session (errors and the "

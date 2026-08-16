@@ -262,6 +262,32 @@ class RolloutController:
             self._wake.set()
             return restored
 
+    def pause(self) -> bool:
+        """Halt the running segment where it stands, leaving the session live.
+
+        Unlike :meth:`reset`, the robot is *not* driven back to its initial position and the task
+        is left untouched -- the arm simply stops receiving actions, which is what an operator
+        wants when halting in a hurry.  Unlike :meth:`stop`, hardware and policy stay warm, so
+        :meth:`start` resumes.
+
+        Returns ``True`` when something was actually halted (a running segment or a pending
+        start), ``False`` when already idle or once the controller is stopping or stopped.
+        """
+        with self._control_lock:
+            if self._stopped.is_set() or self._stop_requested.is_set():
+                return False
+            # Last command wins, as in reset(): cancel a start that has not begun yet.
+            had_pending_start = self._start_requested.is_set()
+            self._start_requested.clear()
+            if not self._running.is_set():
+                self._wake.set()
+                return had_pending_start
+            # Segment stop only -- no _reset_requested, so the serve loop returns to idle
+            # instead of running _reset_robot() and homing the arm.
+            self._segment_stop.set()
+            self._wake.set()
+            return True
+
     def stop(self) -> None:
         """End :meth:`serve` so the caller can run ``strategy.teardown(ctx)``.  Idempotent."""
         with self._control_lock:

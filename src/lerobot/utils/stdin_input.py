@@ -53,9 +53,13 @@ class StdinCommandListener:
         on_eof: Callable[[], None] | None = None,
         stream: IO[str] | IO[bytes] | None = None,
         poll_interval_s: float = 0.2,
+        forward_blank_lines: bool = False,
     ) -> None:
         self._on_line = on_line
         self._on_eof = on_eof
+        # Blank lines are noise for most callers, but a bare Enter is a usable
+        # signal on its own (e.g. an operator hitting it to halt a robot).
+        self._forward_blank_lines = forward_blank_lines
         # sys.stdin can itself be None (pythonw, daemonized processes).
         self._stream = stream if stream is not None else sys.stdin
         self._poll_interval_s = poll_interval_s
@@ -159,7 +163,7 @@ class StdinCommandListener:
 
     def _emit_line(self, line: str) -> None:
         line = line.strip()
-        if not line:
+        if not line and not self._forward_blank_lines:
             return
         try:
             self._on_line(line)
