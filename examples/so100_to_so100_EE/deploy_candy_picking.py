@@ -93,14 +93,18 @@ def main():
     action_kinematics = RobotKinematics(URDF_PATH, "gripper_frame_link", names)
     ik = RobotKinematics(URDF_PATH, "gripper_frame_link", names)
     observation_processor = RobotProcessorPipeline[RobotObservation, RobotObservation](
-        [ForwardKinematicsJointsToEEObservation(fk, names)], observation_to_transition, transition_to_observation
+        steps=[ForwardKinematicsJointsToEEObservation(fk, names)],
+        to_transition=observation_to_transition,
+        to_output=transition_to_observation,
     )
     action_processor = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
         [
             RelativeDeltaToAbsoluteEE(action_kinematics, names),
             EEBoundsAndSafety({"min": [-0.4, -0.4, 0.0], "max": [0.4, 0.4, 0.5]}, max_ee_step_m=0.05),
             InverseKinematicsEEToJoints(ik, names, initial_guess_current_joints=False),
-        ], robot_action_observation_to_transition, transition_to_robot_action,
+        ],
+        to_transition=robot_action_observation_to_transition,
+        to_output=transition_to_robot_action,
     )
 
     events = queue.Queue()
