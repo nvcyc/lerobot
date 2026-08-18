@@ -86,7 +86,7 @@ def main():
     }
     robot = SOFollower(SOFollowerRobotConfig(
         port=args.follower_port, id=args.id, use_degrees=True, cameras=cameras,
-        max_relative_target=10,
+        max_relative_target=10.0,
     ))
     names = list(robot.bus.motors.keys())
     fk = RobotKinematics(URDF_PATH, "gripper_frame_link", names)
