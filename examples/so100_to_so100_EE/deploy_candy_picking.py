@@ -138,6 +138,8 @@ def main():
             values = {key: float(action.squeeze(0).cpu()[i]) for i, key in enumerate(ACTION_KEYS)}
             robot.send_action(action_processor((values, raw)))
             precise_sleep(max(0.0, 1.0 / args.fps - (time.monotonic() - tick)))
+    except KeyboardInterrupt:
+        print("\nStop requested.")
     finally:
         robot.disconnect()
         print("Arms and cameras disconnected.")
