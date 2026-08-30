@@ -5,13 +5,14 @@ Record candy-picking demonstrations with SO-ARM100 leader-follower teleoperation
 Hardware Setup:
   - Follower: /dev/ttyACM0 (robot doing the task)
   - Leader: /dev/ttyACM1 (human controls this one)
-  - Camera: Intel RealSense D455 (serial: 244422300478)
+  - Cameras: left/right Intel RealSense D455 + SO-ARM101 wrist UVC camera
 
 Usage:
   cd /workspace/lerobot/examples/so100_to_so100_EE
   python record_candy_picking.py
 
 Controls during recording:
+  - Before an episode, teleoperate freely and press Enter to start recording
   - Press 's' to STOP recording current episode and save
   - Press 'r' to RE-RECORD current episode (discard and redo)
   - Press 'q' to QUIT recording session
@@ -30,7 +31,6 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
@@ -59,6 +59,7 @@ from lerobot.teleoperators.so_leader.so_leader import SOLeader
 # Text-to-speech not available in headless Docker - using print() instead
 # from lerobot.utils.utils import log_say
 from lerobot.utils.visualization_utils import init_visualization
+from camera_registry import ALL_CAMERA_NAMES, make_camera_config
 
 # ============================================================================
 # CONFIGURATION - Customize these values
@@ -67,8 +68,7 @@ from lerobot.utils.visualization_utils import init_visualization
 # Dataset configuration
 NUM_EPISODES = 50  # Number of demonstrations to collect
 FPS = 30  # Control frequency (Hz)
-EPISODE_TIME_SEC = 30  # Max time per episode (seconds)
-RESET_TIME_SEC = 10  # Time to reset environment between episodes
+EPISODE_TIME_SEC = 120  # Max time per episode (seconds)
 TASK_DESCRIPTION = "Pick colored candy and place in front of person"
 HF_REPO_ID = "local/candy-picking-relative-v1"  # Local storage (no upload)
 
@@ -76,17 +76,8 @@ HF_REPO_ID = "local/candy-picking-relative-v1"  # Local storage (no upload)
 FOLLOWER_PORT = "/dev/ttyACM0"  # Robot arm doing the task
 LEADER_PORT = "/dev/ttyACM1"    # Arm you control by hand
 
-# Camera configuration - Two D455 side views (RGB only)
-CAMERA_LEFT_SERIAL = "244422300478"   # D455 Camera 1
-CAMERA_RIGHT_SERIAL = "035322250292"  # D455 Camera 2
-CAMERA_FPS = 30
-CAMERA_WIDTH = 640   # 640x480 for speed, or 1280x720 for quality
-CAMERA_HEIGHT = 480
-USE_DEPTH = False    # RGB-only (no depth)
-
-# Note: Both D455 cameras on USB 3.2 - full bandwidth available!
-# If left/right cameras are swapped in your physical setup,
-# just swap the serial numbers above!
+# Camera configuration lives in camera_registry.py. The default profile
+# records both side views and the UVC wrist camera in every episode.
 
 # URDF path
 URDF_PATH = "/workspace/SO-ARM100/Simulation/SO101/so101_new_calib.urdf"
@@ -284,8 +275,8 @@ class RelativeDeltaToAbsoluteEE(RobotActionProcessorStep):
 
 
 @contextmanager
-def terminal_recording_controls(events: dict):
-    """Read single-key controls from the terminal without relying on pynput/X11."""
+def terminal_recording_controls(events: dict, *, waiting_for_start: bool = False):
+    """Read episode controls, or Enter to leave the unrecorded teleop standby phase."""
     if not sys.stdin.isatty():
         yield
         return
@@ -301,10 +292,14 @@ def terminal_recording_controls(events: dict):
                 continue
 
             key = sys.stdin.read(1).lower()
-            if key == "s":
+            if waiting_for_start and key in ("\r", "\n"):
+                print("\nStarting recording now...")
+                events["start_recording"] = True
+                events["exit_early"] = True
+            elif key == "s" and not waiting_for_start:
                 print("\nEnding episode and saving...")
                 events["exit_early"] = True
-            elif key == "r":
+            elif key == "r" and not waiting_for_start:
                 print("\nRe-recording episode...")
                 events["rerecord_episode"] = True
                 events["exit_early"] = True
@@ -342,23 +337,8 @@ def main():
     print(f"FPS: {FPS}")
     print()
 
-    # Create dual camera configuration (both cameras working!)
-    camera_config = {
-        "left": RealSenseCameraConfig(
-            serial_number_or_name=CAMERA_LEFT_SERIAL,  # D435i
-            fps=CAMERA_FPS,
-            width=CAMERA_WIDTH,
-            height=CAMERA_HEIGHT,
-            use_depth=USE_DEPTH,  # RGB-only
-        ),
-        "right": RealSenseCameraConfig(
-            serial_number_or_name=CAMERA_RIGHT_SERIAL,  # D435
-            fps=CAMERA_FPS,
-            width=CAMERA_WIDTH,
-            height=CAMERA_HEIGHT,
-            use_depth=USE_DEPTH,  # RGB-only
-        )
-    }
+    camera_config = make_camera_config()
+    print(f"Camera streams: {', '.join(ALL_CAMERA_NAMES)}")
 
     # Create follower configuration (with camera)
     follower_config = SOFollowerRobotConfig(
@@ -507,6 +487,7 @@ def main():
         "exit_early": False,
         "rerecord_episode": False,
         "stop_recording": False,
+        "start_recording": False,
     }
 
     # Live visualization. The cameras are held by this process, so a separate
@@ -543,9 +524,10 @@ def main():
     print("=" * 60)
     print()
     print("Terminal controls:")
-    print("  - Press 's' to finish and save the current episode")
-    print("  - Press 'r' to discard and re-record the current episode")
-    print("  - Press 'q' to stop recording after the current loop")
+    print("  - Before an episode: teleoperate freely, then press ENTER to record")
+    print("  - During an episode: press 's' to finish and save")
+    print("  - During an episode: press 'r' to discard and re-record")
+    print("  - Press 'q' at any time to stop")
     print()
 
     try:
@@ -556,19 +538,42 @@ def main():
         while episode_idx < num_episodes and not events["stop_recording"]:
             print()
             print("=" * 60)
-            print(f"🎬 Recording episode {episode_idx + 1} of {num_episodes}")
+            print(f"🎬 Episode {episode_idx + 1} of {num_episodes}")
             print("=" * 60)
             print()
             print("Instructions:")
-            print("  1. Move leader arm to demonstrate picking a candy")
-            print("  2. Follower will mimic your movements")
-            print("  3. Camera will record RGB-D frames")
-            print("  4. Press 's' when done to save episode")
+            print("  1. Teleoperate freely to position the arms or reset the workspace")
+            print("  2. The follower mirrors the leader, but this standby motion is not recorded")
+            print("  3. Press ENTER to begin recording immediately from the current pose")
+            print("  4. Press 's' to save, or record for up to 2 minutes")
             print()
-            input("Press ENTER to start recording episode...")
-            print()
-            print("Recording... (move the leader arm now)")
-            print()
+
+            # Keep the arms under teleop while waiting. Passing no dataset
+            # means this phase cannot add video or actions to the episode.
+            events["start_recording"] = False
+            leader_joints_to_relative_ee.reset()
+            relative_ee_to_follower_joints.reset()
+            with terminal_recording_controls(events, waiting_for_start=True):
+                record_loop(
+                    robot=follower,
+                    events=events,
+                    fps=FPS,
+                    teleop=leader,
+                    control_time_s=float("inf"),
+                    single_task=TASK_DESCRIPTION,
+                    display_data=display_mode != "none",
+                    display_mode=display_mode if display_mode != "none" else "rerun",
+                    teleop_action_processor=leader_joints_to_relative_ee,
+                    robot_action_processor=relative_ee_to_follower_joints,
+                    robot_observation_processor=follower_joints_to_ee,
+                )
+
+            if events["stop_recording"]:
+                break
+            if not events["start_recording"]:
+                continue
+
+            print("Recording... (up to 2 minutes; press 's' to save)")
 
             leader_joints_to_relative_ee.reset()
             relative_ee_to_follower_joints.reset()
@@ -606,32 +611,6 @@ def main():
             dataset.save_episode()
             print(f"✓ Episode {episode_idx + 1} saved!")
             episode_idx += 1
-
-            # Reset environment between episodes
-            if not events["stop_recording"] and episode_idx < num_episodes:
-                print()
-                print("🔄 Reset the environment")
-                print(f"You have {RESET_TIME_SEC} seconds to reset the workspace")
-                print("  - Return arms to starting position")
-                print("  - Rearrange candies for next episode")
-                print()
-
-                leader_joints_to_relative_ee.reset()
-                relative_ee_to_follower_joints.reset()
-
-                record_loop(
-                    robot=follower,
-                    events=events,
-                    fps=FPS,
-                    teleop=leader,
-                    control_time_s=RESET_TIME_SEC,
-                    single_task=TASK_DESCRIPTION,
-                    display_data=display_mode != "none",
-                    display_mode=display_mode if display_mode != "none" else "rerun",
-                    teleop_action_processor=leader_joints_to_relative_ee,
-                    robot_action_processor=relative_ee_to_follower_joints,
-                    robot_observation_processor=follower_joints_to_ee,
-                )
 
         print()
         print("=" * 60)
