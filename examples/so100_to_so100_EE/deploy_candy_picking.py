@@ -9,7 +9,6 @@ import time
 import numpy as np
 import torch
 
-from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 from lerobot.common.control_utils import predict_action
 from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.model.kinematics import RobotKinematics
@@ -32,6 +31,7 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
 from lerobot.utils.robot_utils import precise_sleep
 
 from record_candy_picking import RelativeDeltaToAbsoluteEE
+from camera_registry import make_camera_config
 
 
 URDF_PATH = "/workspace/SO-ARM100/Simulation/SO101/so101_new_calib.urdf"
@@ -40,6 +40,15 @@ ACTION_KEYS = (
     "ee.delta_x", "ee.delta_y", "ee.delta_z", "ee.delta_wx", "ee.delta_wy", "ee.delta_wz",
     "ee.delta_gripper_pos",
 )
+
+
+def policy_camera_names(policy: ACTPolicy) -> tuple[str, ...]:
+    """Return registry camera names required by the policy checkpoint."""
+    prefix = "observation.images."
+    names = tuple(key.removeprefix(prefix) for key in policy.config.input_features if key.startswith(prefix))
+    if not names:
+        raise ValueError("The policy has no visual input features.")
+    return names
 
 
 def parse_args():
@@ -80,10 +89,9 @@ def main():
         print(f"Loaded {args.policy_path} on {device}; no hardware opened.")
         return
 
-    cameras = {
-        "left": RealSenseCameraConfig(serial_number_or_name="244422300478", fps=30, width=640, height=480),
-        "right": RealSenseCameraConfig(serial_number_or_name="035322250292", fps=30, width=640, height=480),
-    }
+    camera_names = policy_camera_names(policy)
+    cameras = make_camera_config(camera_names)
+    print(f"Policy camera inputs: {', '.join(camera_names)}")
     robot = SOFollower(SOFollowerRobotConfig(
         port=args.follower_port, id=args.id, use_degrees=True, cameras=cameras,
         max_relative_target=10.0,
@@ -131,9 +139,8 @@ def main():
             ee = observation_processor(raw)
             frame = {
                 "observation.state": np.asarray([ee[k] for k in STATE_KEYS], dtype=np.float32),
-                "observation.images.left": raw["left"],
-                "observation.images.right": raw["right"],
             }
+            frame.update({f"observation.images.{name}": raw[name] for name in camera_names})
             action = predict_action(frame, policy, device, preprocessor, postprocessor, False)
             values = {key: float(action.squeeze(0).cpu()[i]) for i, key in enumerate(ACTION_KEYS)}
             robot.send_action(action_processor((values, raw)))
