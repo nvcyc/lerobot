@@ -122,6 +122,10 @@ class RobotKinematics:
         for i, joint_name in enumerate(self.joint_names):
             self.robot.set_joint(joint_name, current_joint_rad[i])
 
+        # Refresh frame transforms and Jacobians for this seed before solving.
+        # set_joint alone leaves the previous configuration's kinematics cached.
+        self.robot.update_kinematics()
+
         # Update the target pose for the frame task
         self.tip_frame.T_world_frame = desired_ee_pose
 
