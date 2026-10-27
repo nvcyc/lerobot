@@ -210,8 +210,10 @@ class RTCProcessor:
         )
 
         with torch.enable_grad():
-            v_t = original_denoise_step_partial(x_t)
+            # Track the denoiser's input before its forward pass. Enabling this
+            # afterwards drops dv/dx from the vector-Jacobian product below.
             x_t.requires_grad_(True)
+            v_t = original_denoise_step_partial(x_t)
 
             x1_t = x_t - time * v_t  # noqa: N806
             err = (prev_chunk_left_over - x1_t) * weights
